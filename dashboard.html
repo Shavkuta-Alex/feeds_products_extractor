@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Best-Seller Prediction Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+  .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 24px; font-weight: 700; margin-bottom: 4px; }
+  .subtitle { color: #64748b; font-size: 14px; margin-bottom: 24px; }
+  .subtitle strong { color: #94a3b8; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid #1e293b; padding-bottom: 4px; }
+  .tab { padding: 8px 16px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 14px; color: #94a3b8; background: transparent; border: none; transition: all 0.2s; }
+  .tab:hover { color: #e2e8f0; background: #1e293b; }
+  .tab.active { color: #38bdf8; background: #1e293b; border-bottom: 2px solid #38bdf8; }
+  .grid { display: grid; gap: 16px; margin-bottom: 16px; }
+  .grid-2 { grid-template-columns: repeat(2, 1fr); }
+  .grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .grid-4 { grid-template-columns: repeat(4, 1fr); }
+  .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; margin-bottom: 16px; }
+  .card-header { font-size: 13px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .card-value { font-size: 28px; font-weight: 700; }
+  .green { color: #4ade80; }
+  .blue { color: #38bdf8; }
+  .purple { color: #a78bfa; }
+  .orange { color: #fb923c; }
+  .card-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
+  .stat-row { display: flex; gap: 24px; margin-top: 12px; flex-wrap: wrap; }
+  .stat-item { color: #94a3b8; font-size: 14px; }
+  .stat-item span { color: #64748b; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 12px; color: #64748b; border-bottom: 1px solid #334155; font-weight: 500; }
+  td { padding: 10px 12px; border-bottom: 1px solid #1e293b; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr:hover td { background: rgba(56,189,248,0.05); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; }
+  .badge-green { background: #064e3b; color: #34d399; }
+  .badge-red { background: #450a0a; color: #f87171; }
+  .badge-blue { background: #0c4a6e; color: #38bdf8; }
+  .loading { display: flex; align-items: center; justify-content: center; height: 60vh; font-size: 18px; color: #64748b; }
+  .error { color: #f87171; text-align: center; padding: 40px; font-size: 16px; }
+  .bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 300px; padding: 16px 0; }
+  .bar-wrapper { flex: 1; display: flex; flex-direction: column; align-items: center; }
+  .bar { background: #38bdf8; border-radius: 3px 3px 0 0; min-width: 20px; width: 100%; transition: background 0.2s; cursor: default; position: relative; }
+  .bar:hover { background: #7dd3fc; }
+  .bar-label { font-size: 10px; color: #64748b; margin-top: 4px; transform: rotate(-45deg); white-space: nowrap; }
+  .bar-tooltip { display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #334155; color: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; margin-bottom: 4px; }
+  .bar:hover .bar-tooltip { display: block; }
+  .pie-container { display: flex; justify-content: center; align-items: center; gap: 24px; padding: 20px; }
+  .pie-legend { display: flex; flex-direction: column; gap: 8px; }
+  .pie-legend-item { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .pie-legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+  .hidden { display: none; }
+  @media (max-width: 768px) { .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="container" id="app">
+  <div class="loading" id="loading">Loading results.json...</div>
+  <div class="error hidden" id="error"></div>
+  <div class="hidden" id="content">
+    <h1>Best-Seller Prediction Dashboard</h1>
+    <div class="subtitle" id="subtitle"></div>
+    <div class="tabs" id="tabs"></div>
+    <div id="tab-content"></div>
+  </div>
+</div>
+
+<script>
+(function() {
+  const COLORS = ['#38bdf8', '#4ade80', '#a78bfa', '#fb923c', '#f87171', '#fbbf24'];
+  let DATA = null;
+  let currentTab = 'overview';
+
+  fetch('./results.json')
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(data => { DATA = data; render(); })
+    .catch(err => {
+      document.getElementById('loading').classList.add('hidden');
+      const el = document.getElementById('error');
+      el.textContent = 'Failed to load results.json: ' + err.message;
+      el.classList.remove('hidden');
+    });
+
+  function render() {
+    document.getElementById('loading').classList.add('hidden');
+    document.getElementById('content').classList.remove('hidden');
+
+    const report = DATA.training_report || {};
+    const feed = DATA.scored_feed || {};
+
+    // Subtitle
+    const mode = report.mode === 'one_class' ? 'One-Class (Isolation Forest)' : 'Binary (LightGBM)';
+    document.getElementById('subtitle').innerHTML =
+      'Mode: <strong>' + mode + '</strong> &middot; ' +
+      (feed.total_products || 0).toLocaleString() + ' products scored';
+
+    // Tabs
+    const tabs = ['overview', 'distribution', 'stores', 'products'];
+    const tabsEl = document.getElementById('tabs');
+    tabsEl.innerHTML = '';
+    tabs.forEach(t => {
+      const btn = document.createElement('button');
+      btn.className = 'tab' + (t === currentTab ? ' active' : '');
+      btn.textContent = t.charAt(0).toUpperCase() + t.slice(1);
+      btn.onclick = () => { currentTab = t; render(); };
+      tabsEl.appendChild(btn);
+    });
+
+    // Tab content
+    const content = document.getElementById('tab-content');
+    content.innerHTML = '';
+    if (currentTab === 'overview') renderOverview(content, report, feed);
+    else if (currentTab === 'distribution') renderDistribution(content, feed);
+    else if (currentTab === 'stores') renderStores(content, feed);
+    else if (currentTab === 'products') renderProducts(content, feed);
+  }
+
+  function renderOverview(el, report, feed) {
+    const pct = feed.total_products > 0
+      ? ((feed.predicted_selling / feed.total_products) * 100).toFixed(1) : '0';
+    const engFeatures = report.feature_count ? (report.feature_count - 500) : 0;
+
+    el.innerHTML = `
+      <div class="grid grid-4">
+        <div class="card">
+          <div class="card-header">Total Products</div>
+          <div class="card-value blue">${(feed.total_products || 0).toLocaleString()}</div>
+        </div>
+        <div class="card">
+          <div class="card-header">Predicted Selling</div>
+          <div class="card-value green">${(feed.predicted_selling || 0).toLocaleString()}</div>
+          <div class="card-sub">${pct}% of total</div>
+        </div>
+        <div class="card">
+          <div class="card-header">Features Used</div>
+          <div class="card-value purple">${report.feature_count || 'N/A'}</div>
+          <div class="card-sub">${engFeatures} engineered + 500 TF-IDF</div>
+        </div>
+        <div class="card">
+          <div class="card-header">Training Size</div>
+          <div class="card-value orange">${(report.train_size || 0).toLocaleString()}</div>
+        </div>
+      </div>
+    `;
+
+    if (report.mode === 'one_class' && report.anomaly_score_percentiles) {
+      const p = report.anomaly_score_percentiles;
+      el.innerHTML += `
+        <div class="card">
+          <div class="card-header">Anomaly Score Distribution (Training Data)</div>
+          <div class="stat-row">
+            <div class="stat-item"><span>Mean: </span>${report.anomaly_score_mean}</div>
+            <div class="stat-item"><span>Std: </span>${report.anomaly_score_std}</div>
+            <div class="stat-item"><span>p5: </span>${p.p5}</div>
+            <div class="stat-item"><span>p25: </span>${p.p25}</div>
+            <div class="stat-item"><span>p50: </span>${p.p50}</div>
+            <div class="stat-item"><span>p75: </span>${p.p75}</div>
+            <div class="stat-item"><span>p95: </span>${p.p95}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (report.mode === 'binary' && report.classification_report) {
+      const cr = report.classification_report['1'] || {};
+      el.innerHTML += `
+        <div class="grid grid-4">
+          <div class="card">
+            <div class="card-header">AUC-ROC</div>
+            <div class="card-value green">${report.auc_roc || 'N/A'}</div>
+          </div>
+          <div class="card">
+            <div class="card-header">Precision</div>
+            <div class="card-value blue">${cr.precision != null ? cr.precision.toFixed(3) : 'N/A'}</div>
+          </div>
+          <div class="card">
+            <div class="card-header">Recall</div>
+            <div class="card-value purple">${cr.recall != null ? cr.recall.toFixed(3) : 'N/A'}</div>
+          </div>
+          <div class="card">
+            <div class="card-header">F1 Score</div>
+            <div class="card-value orange">${cr['f1-score'] != null ? cr['f1-score'].toFixed(3) : 'N/A'}</div>
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  function renderDistribution(el, feed) {
+    const dist = feed.score_distribution || [];
+    if (dist.length === 0) { el.innerHTML = '<div class="card">No distribution data</div>'; return; }
+
+    const maxCount = Math.max(...dist.map(d => d.count));
+
+    let barsHtml = dist.map(d => {
+      const h = maxCount > 0 ? Math.max(2, (d.count / maxCount) * 280) : 2;
+      return `
+        <div class="bar-wrapper">
+          <div class="bar" style="height:${h}px">
+            <div class="bar-tooltip">${d.bin_start}-${d.bin_end}: ${d.count.toLocaleString()}</div>
+          </div>
+          <div class="bar-label">${d.bin_start}</div>
+        </div>
+      `;
+    }).join('');
+
+    el.innerHTML = `
+      <div class="card">
+        <div class="card-header">Combined Score Distribution</div>
+        <div class="bar-chart">${barsHtml}</div>
+      </div>
+    `;
+  }
+
+  function renderStores(el, feed) {
+    const stores = feed.store_stats || [];
+    if (stores.length === 0) { el.innerHTML = '<div class="card">No store data</div>'; return; }
+
+    const total = stores.reduce((s, st) => s + st.total, 0);
+
+    const legendHtml = stores.map((s, i) => {
+      const pct = total > 0 ? ((s.total / total) * 100).toFixed(1) : '0';
+      return `
+        <div class="pie-legend-item">
+          <div class="pie-legend-dot" style="background:${COLORS[i % COLORS.length]}"></div>
+          ${s.store}: ${s.total.toLocaleString()} (${pct}%)
+        </div>
+      `;
+    }).join('');
+
+    // Simple CSS pie chart
+    let gradientParts = [];
+    let offset = 0;
+    stores.forEach((s, i) => {
+      const pct = total > 0 ? (s.total / total) * 100 : 0;
+      gradientParts.push(`${COLORS[i % COLORS.length]} ${offset}% ${offset + pct}%`);
+      offset += pct;
+    });
+    const gradient = `conic-gradient(${gradientParts.join(', ')})`;
+
+    const tableRows = stores.map(s => `
+      <tr>
+        <td><span class="badge badge-blue">${s.store}</span></td>
+        <td>${s.total.toLocaleString()}</td>
+        <td>${s.predicted_selling.toLocaleString()}</td>
+        <td>${s.avg_score}</td>
+        <td>${s.median_score}</td>
+      </tr>
+    `).join('');
+
+    el.innerHTML = `
+      <div class="grid grid-2">
+        <div class="card">
+          <div class="card-header">Products by Store</div>
+          <div class="pie-container">
+            <div style="width:200px;height:200px;border-radius:50%;background:${gradient}"></div>
+            <div class="pie-legend">${legendHtml}</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">Store Comparison</div>
+          <table>
+            <thead><tr><th>Store</th><th>Total</th><th>Predicted Selling</th><th>Avg Score</th><th>Median</th></tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderProducts(el, feed) {
+    const samples = feed.sample_products || {};
+
+    function productTable(products, label) {
+      if (!products || products.length === 0) return `<div class="card"><div class="card-header">${label}</div><p style="color:#64748b;margin-top:8px">No products</p></div>`;
+      const rows = products.map(p => {
+        const price = typeof p.price === 'number' ? '\u20ac' + p.price.toFixed(2) : (p.price || 'N/A');
+        const selling = p.predicted_selling ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-red">No</span>';
+        return `
+          <tr>
+            <td>${p.title || 'N/A'}</td>
+            <td>${price}</td>
+            <td><span class="badge badge-blue">${p.store_source || '\u2014'}</span></td>
+            <td>${p.heuristic_score != null ? p.heuristic_score : 'N/A'}</td>
+            <td>${p.ml_probability != null ? p.ml_probability : 'N/A'}</td>
+            <td>${p.combined_score != null ? p.combined_score : 'N/A'}</td>
+            <td>${selling}</td>
+          </tr>
+        `;
+      }).join('');
+
+      return `
+        <div class="card">
+          <div class="card-header">${label}</div>
+          <div style="overflow-x:auto">
+            <table>
+              <thead><tr><th>Title</th><th>Price</th><th>Store</th><th>Heuristic</th><th>ML Prob</th><th>Combined</th><th>Selling?</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+
+    el.innerHTML = productTable(samples.top_scored, 'Top Scored Best Sellers');
+  }
+})();
+</script>
+</body>
+</html>

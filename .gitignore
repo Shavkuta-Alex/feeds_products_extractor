@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+.DS_Store
+results.json
+model/
+*.joblib
+node_modules/
+input_feeds/
