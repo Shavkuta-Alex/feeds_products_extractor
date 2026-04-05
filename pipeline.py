@@ -337,6 +337,242 @@ class FeatureEngineer:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Product Text Serialization (for embedding models)
+# ---------------------------------------------------------------------------
+
+class ProductTextSerializer:
+    """Serialize product rows into text strings for embedding models."""
+
+    def serialize(self, df: pd.DataFrame) -> list:
+        return df.apply(self._serialize_row, axis=1).tolist()
+
+    @staticmethod
+    def _serialize_row(row) -> str:
+        parts = []
+
+        title = str(row.get("title", "")).strip()
+        if title:
+            parts.append(title)
+
+        brand = str(row.get("brand", "")).strip()
+        if brand and brand.upper() not in ("NONE", "", "NAN"):
+            parts.append(f"Brand: {brand}")
+
+        price = row.get("price")
+        try:
+            price = float(price)
+            if price > 0:
+                parts.append(f"Price: {price:.2f} EUR")
+        except (TypeError, ValueError):
+            pass
+
+        condition = str(row.get("condition_normalized", "")).strip()
+        if condition and condition not in ("other", "", "nan"):
+            parts.append(f"Condition: {condition}")
+
+        sale_price = row.get("sale_price")
+        try:
+            sale_price = float(sale_price)
+            if price and price > 0 and sale_price < price:
+                pct = round((1 - sale_price / price) * 100)
+                parts.append(f"Discount: {pct}%")
+        except (TypeError, ValueError):
+            pass
+
+        store = str(row.get("store_source", "")).strip()
+        if store and store != "nan":
+            parts.append(f"Store: {store}")
+
+        region = str(row.get("region", "")).strip()
+        if region and region != "nan":
+            parts.append(f"Region: {region.upper()}")
+
+        return " | ".join(parts) if parts else "unknown product"
+
+
+# ---------------------------------------------------------------------------
+# 2c. Embedding Fine-Tuning (TSDAE)
+# ---------------------------------------------------------------------------
+
+class EmbeddingFineTuner:
+    """TSDAE fine-tuning of a sentence-transformer on product text."""
+
+    def __init__(
+        self,
+        model_name: str = "Alibaba-NLP/gte-multilingual-base",
+        max_train_samples: int = 200_000,
+        batch_size: int = 32,
+        epochs: int = 1,
+        lr: float = 3e-5,
+        deletion_ratio: float = 0.6,
+    ):
+        self.model_name = model_name
+        self.max_train_samples = max_train_samples
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.lr = lr
+        self.deletion_ratio = deletion_ratio
+
+    def fine_tune(self, texts: list, output_dir: str) -> dict:
+        """Fine-tune with TSDAE. Returns training metadata."""
+        import time
+        from sentence_transformers import SentenceTransformer, losses
+        from sentence_transformers.datasets import DenoisingAutoEncoderDataset
+        from torch.utils.data import DataLoader
+
+        print(f"  Loading base model: {self.model_name}")
+        model = SentenceTransformer(self.model_name)
+
+        # Subsample if needed
+        if len(texts) > self.max_train_samples:
+            rng = np.random.RandomState(42)
+            indices = rng.choice(len(texts), self.max_train_samples, replace=False)
+            texts = [texts[i] for i in indices]
+            print(f"  Subsampled to {len(texts):,} texts")
+
+        # Create TSDAE dataset and dataloader
+        train_dataset = DenoisingAutoEncoderDataset(texts)
+        train_dataloader = DataLoader(
+            train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True,
+        )
+
+        # TSDAE loss
+        train_loss = losses.DenoisingAutoEncoderLoss(
+            model,
+            decoder_name_or_path=self.model_name,
+            tie_encoder_decoder=False,  # True is broken with transformers>=5.0
+        )
+
+        total_steps = len(train_dataloader) * self.epochs
+        warmup_steps = min(500, total_steps // 10)
+        print(f"  Training: {len(texts):,} texts, {total_steps:,} steps, "
+              f"{self.epochs} epoch(s), batch_size={self.batch_size}")
+
+        start = time.time()
+        model.fit(
+            train_objectives=[(train_dataloader, train_loss)],
+            epochs=self.epochs,
+            weight_decay=0,
+            scheduler="constantlr",
+            optimizer_params={"lr": self.lr},
+            show_progress_bar=True,
+            warmup_steps=warmup_steps,
+        )
+        duration = time.time() - start
+
+        # Save fine-tuned model
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        model.save(output_dir)
+        print(f"  Model saved to {output_dir}/")
+
+        return {
+            "base_model": self.model_name,
+            "train_samples": len(texts),
+            "total_steps": total_steps,
+            "epochs": self.epochs,
+            "duration_seconds": round(duration, 1),
+            "output_dir": output_dir,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 2d. Embedding Scorer (centroid-based one-class scoring)
+# ---------------------------------------------------------------------------
+
+class EmbeddingScorer:
+    """
+    Centroid-based one-class scoring using embeddings.
+
+    Computes the centroid of all best-seller embeddings, then scores
+    new products by cosine similarity to the centroid.
+    """
+
+    def __init__(
+        self,
+        model_name_or_path: str = "Alibaba-NLP/gte-multilingual-base",
+        batch_size: int = 256,
+    ):
+        self.model_name_or_path = model_name_or_path
+        self.batch_size = batch_size
+        self.model = None
+        self.global_centroid = None
+        self.similarity_stats = {}
+        self.is_fitted = False
+
+    def _load_model(self):
+        if self.model is None:
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer(self.model_name_or_path)
+
+    def _encode(self, texts: list) -> np.ndarray:
+        self._load_model()
+        return self.model.encode(
+            texts,
+            batch_size=self.batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=True,
+        )
+
+    def fit(self, texts: list) -> dict:
+        """Compute centroid from best-seller product texts."""
+        print(f"  Encoding {len(texts):,} products...")
+        embeddings = self._encode(texts).astype(np.float64)
+
+        # Compute centroid (L2-normalized mean)
+        centroid = embeddings.mean(axis=0)
+        centroid = centroid / np.linalg.norm(centroid)
+        self.global_centroid = centroid
+
+        # Compute similarity distribution for calibration
+        sims = embeddings @ centroid
+        self.similarity_stats = {
+            "mean": round(float(sims.mean()), 6),
+            "std": round(float(sims.std()), 6),
+            "min": round(float(sims.min()), 6),
+            "max": round(float(sims.max()), 6),
+            "p5": round(float(np.percentile(sims, 5)), 6),
+            "p25": round(float(np.percentile(sims, 25)), 6),
+            "p50": round(float(np.percentile(sims, 50)), 6),
+            "p75": round(float(np.percentile(sims, 75)), 6),
+            "p95": round(float(np.percentile(sims, 95)), 6),
+        }
+        self.is_fitted = True
+
+        print(f"  Centroid computed. Similarity stats:")
+        for k, v in self.similarity_stats.items():
+            print(f"    {k}: {v:.4f}")
+
+        return {
+            "embedding_dim": len(centroid),
+            "train_size": len(texts),
+            "similarity_stats": self.similarity_stats,
+        }
+
+    def predict(self, texts: list, threshold: float = 50.0) -> pd.DataFrame:
+        """Score products by cosine similarity to centroid."""
+        if not self.is_fitted:
+            raise RuntimeError("EmbeddingScorer not fitted. Call fit() first.")
+
+        embeddings = self._encode(texts).astype(np.float64)
+        sims = embeddings @ self.global_centroid
+
+        # Calibrate to 0-100 using percentile-based scaling
+        p5 = self.similarity_stats["p5"]
+        p95 = self.similarity_stats["p95"]
+        if p95 - p5 > 0:
+            calibrated = (sims - p5) / (p95 - p5) * 90 + 5  # maps p5->5, p95->95
+        else:
+            calibrated = np.full_like(sims, 50.0)
+        calibrated = np.clip(calibrated, 0, 100).round(1)
+
+        return pd.DataFrame({
+            "embedding_similarity": sims.round(4),
+            "embedding_probability": calibrated,
+            "embedding_is_bestseller": (calibrated >= threshold).astype(int),
+        })
+
+
+# ---------------------------------------------------------------------------
 # 3. Heuristic Scorer
 # ---------------------------------------------------------------------------
 
@@ -663,9 +899,22 @@ class ModelStore:
             components["profiler"] = pipeline.profiler
         if pipeline.classifier and pipeline.classifier.is_fitted:
             components["classifier"] = pipeline.classifier
+        if pipeline.text_serializer:
+            components["text_serializer"] = pipeline.text_serializer
+
+        # Save embedding scorer separately (centroid + stats, not the model weights)
+        if pipeline.embedding_scorer and pipeline.embedding_scorer.is_fitted:
+            joblib.dump({
+                "global_centroid": pipeline.embedding_scorer.global_centroid,
+                "similarity_stats": pipeline.embedding_scorer.similarity_stats,
+                "model_name_or_path": pipeline.embedding_scorer.model_name_or_path,
+                "batch_size": pipeline.embedding_scorer.batch_size,
+            }, p / "embedding_scorer.joblib")
+            components["embedding_scorer"] = True  # marker for metadata
 
         for name, obj in components.items():
-            joblib.dump(obj, p / f"{name}.joblib")
+            if name != "embedding_scorer":
+                joblib.dump(obj, p / f"{name}.joblib")
 
         metadata = {
             "mode": pipeline.mode,
@@ -683,8 +932,19 @@ class ModelStore:
 
         pipeline = ProductScoringPipeline(mode=metadata["mode"])
         for name in metadata["components"]:
-            obj = joblib.load(p / f"{name}.joblib")
-            setattr(pipeline, name, obj)
+            if name == "embedding_scorer":
+                data = joblib.load(p / "embedding_scorer.joblib")
+                scorer = EmbeddingScorer(
+                    model_name_or_path=data["model_name_or_path"],
+                    batch_size=data["batch_size"],
+                )
+                scorer.global_centroid = data["global_centroid"]
+                scorer.similarity_stats = data["similarity_stats"]
+                scorer.is_fitted = True
+                pipeline.embedding_scorer = scorer
+            else:
+                obj = joblib.load(p / f"{name}.joblib")
+                setattr(pipeline, name, obj)
         return pipeline
 
 
@@ -697,23 +957,38 @@ class ProductScoringPipeline:
     End-to-end pipeline:
       - 'one_class' mode: learns best-seller profile (Isolation Forest)
       - 'binary' mode: supervised classification (LightGBM)
+      - 'embedding' mode: fine-tuned embedding model + centroid scoring
     """
 
-    def __init__(self, mode: str = "one_class", weights: Optional[ScoringWeights] = None):
+    def __init__(self, mode: str = "one_class", weights: Optional[ScoringWeights] = None,
+                 embedding_model: Optional[str] = None):
         self.mode = mode
         self.feature_engineer = FeatureEngineer()
         self.text_extractor = TextFeatureExtractor()
         self.heuristic_scorer = HeuristicScorer(weights)
+        self.text_serializer = ProductTextSerializer()
         self.profiler = BestSellerProfiler() if mode == "one_class" else None
         self.classifier = SellingClassifier() if mode == "binary" else None
+        self.embedding_scorer = (
+            EmbeddingScorer(model_name_or_path=embedding_model or "Alibaba-NLP/gte-multilingual-base")
+            if mode == "embedding" else None
+        )
 
     def train(self, df: pd.DataFrame, labels: Optional[pd.Series] = None):
         """
         Train the pipeline.
         - one_class: df = best-seller data, labels ignored
         - binary: df = combined data, labels required (0/1)
+        - embedding: df = best-seller data, computes centroid
         """
         features = self.feature_engineer.transform(df)
+
+        if self.mode == "embedding":
+            texts = self.text_serializer.serialize(df)
+            report = self.embedding_scorer.fit(texts)
+            report["mode"] = "embedding"
+            return report
+
         text_features = self.text_extractor.fit_transform(df)
 
         if self.mode == "one_class":
@@ -733,26 +1008,36 @@ class ProductScoringPipeline:
         result = df.copy()
         result["heuristic_score"] = heuristic_scores
 
-        text_features = None
-        if self.text_extractor.is_fitted:
-            text_features = self.text_extractor.transform(df)
-
-        if self.mode == "one_class" and self.profiler and self.profiler.is_fitted:
-            ml_results = self.profiler.predict(features, text_features)
-            result["ml_probability"] = ml_results["ml_selling_probability"]
-            result["ml_is_selling"] = ml_results["ml_is_selling"]
-            result["combined_score"] = (
-                result["heuristic_score"] * 0.3 + result["ml_probability"] * 0.7
-            ).round(1)
-        elif self.mode == "binary" and self.classifier and self.classifier.is_fitted:
-            ml_results = self.classifier.predict(features, text_features)
-            result["ml_probability"] = ml_results["ml_selling_probability"]
-            result["ml_is_selling"] = ml_results["ml_is_selling"]
+        if self.mode == "embedding" and self.embedding_scorer and self.embedding_scorer.is_fitted:
+            texts = self.text_serializer.serialize(df)
+            emb_results = self.embedding_scorer.predict(texts, threshold=threshold)
+            result["ml_probability"] = emb_results["embedding_probability"]
+            result["embedding_similarity"] = emb_results["embedding_similarity"]
+            result["ml_is_selling"] = emb_results["embedding_is_bestseller"]
             result["combined_score"] = (
                 result["heuristic_score"] * 0.3 + result["ml_probability"] * 0.7
             ).round(1)
         else:
-            result["combined_score"] = result["heuristic_score"]
+            text_features = None
+            if self.text_extractor.is_fitted:
+                text_features = self.text_extractor.transform(df)
+
+            if self.mode == "one_class" and self.profiler and self.profiler.is_fitted:
+                ml_results = self.profiler.predict(features, text_features)
+                result["ml_probability"] = ml_results["ml_selling_probability"]
+                result["ml_is_selling"] = ml_results["ml_is_selling"]
+                result["combined_score"] = (
+                    result["heuristic_score"] * 0.3 + result["ml_probability"] * 0.7
+                ).round(1)
+            elif self.mode == "binary" and self.classifier and self.classifier.is_fitted:
+                ml_results = self.classifier.predict(features, text_features)
+                result["ml_probability"] = ml_results["ml_selling_probability"]
+                result["ml_is_selling"] = ml_results["ml_is_selling"]
+                result["combined_score"] = (
+                    result["heuristic_score"] * 0.3 + result["ml_probability"] * 0.7
+                ).round(1)
+            else:
+                result["combined_score"] = result["heuristic_score"]
 
         result["predicted_selling"] = (result["combined_score"] >= threshold).astype(int)
         return result

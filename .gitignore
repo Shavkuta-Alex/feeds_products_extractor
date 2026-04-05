@@ -5,7 +5,12 @@ venv/
 .venv/
 .DS_Store
 results.json
+results_test.json
+data/
 model/
+models/
 *.joblib
+*.pt
+*.safetensors
 node_modules/
 input_feeds/
