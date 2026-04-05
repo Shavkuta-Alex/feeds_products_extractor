@@ -2,10 +2,12 @@
 CLI for Best-Seller Prediction Pipeline
 =========================================
 Modes:
-  demo           — run on synthetic data (no files needed)
-  train-profile  — train one-class model on best-seller feeds (Phase 1)
-  train-binary   — train binary classifier with best-seller + general feeds (Phase 2)
-  score          — score new products with a saved model
+  demo             — run on synthetic data (no files needed)
+  train-profile    — train one-class model on best-seller feeds (Phase 1)
+  train-binary     — train binary classifier with best-seller + general feeds (Phase 2)
+  fine-tune        — TSDAE fine-tuning of embedding model on best-seller text (Phase 3)
+  train-embedding  — compute centroids from embeddings and save pipeline (Phase 3)
+  score            — score new products with a saved model
 """
 
 import argparse
@@ -16,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline import (
+    EmbeddingFineTuner,
     ProductScoringPipeline,
     load_feed,
     normalize_columns,
@@ -282,6 +285,138 @@ def run_train_binary(args):
     print("\n✅ Training complete!")
 
 
+def run_fine_tune(args):
+    """Fine-tune embedding model on best-seller text with TSDAE."""
+    if not args.best_sellers:
+        print("Error: --best-sellers required", file=sys.stderr)
+        sys.exit(1)
+
+    print("Loading best-seller feeds...")
+    combined = load_multi_store(args.best_sellers)
+
+    # Serialize product text
+    from pipeline import ProductTextSerializer
+    serializer = ProductTextSerializer()
+    print(f"\nSerializing {len(combined):,} products to text...")
+    texts = serializer.serialize(combined)
+    print(f"  Sample: {texts[0][:120]}...")
+
+    # Fine-tune
+    tuner = EmbeddingFineTuner(
+        model_name=args.embedding_model,
+        max_train_samples=args.max_samples,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+    )
+    print(f"\nFine-tuning {args.embedding_model} with TSDAE...")
+    report = tuner.fine_tune(texts, args.output_dir)
+
+    print(f"\n  Training complete!")
+    print(f"  Samples: {report['train_samples']:,}")
+    print(f"  Steps: {report['total_steps']:,}")
+    print(f"  Duration: {report['duration_seconds']:.0f}s")
+    print(f"  Model saved to: {report['output_dir']}/")
+
+
+def run_train_embedding(args):
+    """Compute embedding centroids and save pipeline."""
+    if not args.best_sellers:
+        print("Error: --best-sellers required", file=sys.stderr)
+        sys.exit(1)
+
+    print("Loading best-seller feeds...")
+    combined = load_multi_store(args.best_sellers)
+
+    embedding_model = args.embedding_model or "Alibaba-NLP/gte-multilingual-base"
+    pipeline = ProductScoringPipeline(mode="embedding", embedding_model=embedding_model)
+
+    print(f"\nComputing embeddings with {embedding_model}...")
+    report = pipeline.train(combined)
+    print(f"  Embedding dim: {report['embedding_dim']}")
+    print(f"  Train size: {report['train_size']:,}")
+
+    # Proxy evaluation using eBay CUSTOM_LABEL_0 if available
+    eval_report = {}
+    if "custom_label_0" in combined.columns:
+        print("\nRunning proxy evaluation (CUSTOM_LABEL_0)...")
+        eval_report = _evaluate_proxy_labels(pipeline, combined)
+        report["proxy_evaluation"] = eval_report
+
+    # Score all products
+    print("\nScoring all products...")
+    scored = pipeline.score(combined, threshold=args.threshold)
+    selling = scored["predicted_selling"].sum()
+    print(f"  Predicted selling: {selling:,} / {len(scored):,} "
+          f"({selling / len(scored) * 100:.1f}%)")
+
+    if args.save_model:
+        pipeline.save(args.save_model)
+        print(f"\n  Pipeline saved to {args.save_model}/")
+
+    output = build_dashboard_json(report, scored)
+    out_path = args.output or "results_embedding.json"
+    with open(out_path, "w") as f:
+        json.dump(output, f, indent=2, default=str)
+    print(f"  Dashboard JSON saved to {out_path}")
+
+    print("\n  Training complete!")
+
+
+def _evaluate_proxy_labels(pipeline, df):
+    """Evaluate using eBay CUSTOM_LABEL_0 as proxy ground truth."""
+    from sklearn.metrics import roc_auc_score
+
+    performers = df[df["custom_label_0"].isin(["HighPerforming", "VeryHighPerforming"])]
+    zombies = df[df["custom_label_0"] == "Zombie"]
+
+    if len(performers) == 0 or len(zombies) == 0:
+        print("  No proxy labels available for evaluation.")
+        return {}
+
+    # Sample negatives for evaluation
+    n_neg = min(5000, len(zombies))
+    zombie_sample = zombies.sample(n=n_neg, random_state=42)
+
+    eval_df = pd.concat([performers, zombie_sample], ignore_index=True)
+    labels = pd.concat([
+        pd.Series(1, index=range(len(performers))),
+        pd.Series(0, index=range(len(performers), len(performers) + len(zombie_sample))),
+    ])
+
+    # Score the evaluation set
+    scored = pipeline.score(eval_df)
+
+    if "ml_probability" in scored.columns:
+        auc = float(roc_auc_score(labels, scored["ml_probability"]))
+    elif "combined_score" in scored.columns:
+        auc = float(roc_auc_score(labels, scored["combined_score"]))
+    else:
+        return {}
+
+    # Score distribution by class
+    perf_scores = scored.iloc[:len(performers)]["ml_probability"] if "ml_probability" in scored.columns else scored.iloc[:len(performers)]["combined_score"]
+    zombie_scores = scored.iloc[len(performers):]["ml_probability"] if "ml_probability" in scored.columns else scored.iloc[len(performers):]["combined_score"]
+
+    result = {
+        "proxy_auc_roc": round(auc, 4),
+        "n_performers": len(performers),
+        "n_zombies_sampled": n_neg,
+        "performer_score_mean": round(float(perf_scores.mean()), 1),
+        "performer_score_median": round(float(perf_scores.median()), 1),
+        "zombie_score_mean": round(float(zombie_scores.mean()), 1),
+        "zombie_score_median": round(float(zombie_scores.median()), 1),
+    }
+
+    print(f"  Proxy AUC-ROC: {result['proxy_auc_roc']}")
+    print(f"  Performers ({result['n_performers']}): "
+          f"mean={result['performer_score_mean']}, median={result['performer_score_median']}")
+    print(f"  Zombies ({result['n_zombies_sampled']}): "
+          f"mean={result['zombie_score_mean']}, median={result['zombie_score_median']}")
+
+    return result
+
+
 def run_score(args):
     """Score new products with a saved model."""
     if not args.load_model:
@@ -355,6 +490,31 @@ def parse_args():
     tb.add_argument("--threshold", type=float, default=50.0)
     tb.add_argument("--output", type=str, default=None)
 
+    # fine-tune
+    ft = subparsers.add_parser("fine-tune", help="TSDAE fine-tuning of embedding model (Phase 3)")
+    ft.add_argument("--best-sellers", nargs="+", required=True,
+                    help="Best-seller feeds: 'path.csv:store_name'")
+    ft.add_argument("--embedding-model", type=str, default="Alibaba-NLP/gte-multilingual-base",
+                    help="Base embedding model name (default: gte-multilingual-base)")
+    ft.add_argument("--max-samples", type=int, default=200_000,
+                    help="Max training samples (default: 200000)")
+    ft.add_argument("--batch-size", type=int, default=32)
+    ft.add_argument("--epochs", type=int, default=1)
+    ft.add_argument("--lr", type=float, default=3e-5)
+    ft.add_argument("--output-dir", type=str, default="models/tsdae_model",
+                    help="Where to save fine-tuned model")
+
+    # train-embedding
+    te = subparsers.add_parser("train-embedding", help="Compute embedding centroids (Phase 3)")
+    te.add_argument("--best-sellers", nargs="+", required=True,
+                    help="Best-seller feeds: 'path.csv:store_name'")
+    te.add_argument("--embedding-model", type=str, default=None,
+                    help="Fine-tuned model path or HF model name")
+    te.add_argument("--save-model", type=str, default=None,
+                    help="Where to save the pipeline")
+    te.add_argument("--threshold", type=float, default=50.0)
+    te.add_argument("--output", type=str, default=None)
+
     # score
     sc = subparsers.add_parser("score", help="Score new products")
     sc.add_argument("--feed", type=str, required=True)
@@ -374,6 +534,10 @@ def main():
         run_train_profile(args)
     elif args.command == "train-binary":
         run_train_binary(args)
+    elif args.command == "fine-tune":
+        run_fine_tune(args)
+    elif args.command == "train-embedding":
+        run_train_embedding(args)
     elif args.command == "score":
         run_score(args)
     else:
